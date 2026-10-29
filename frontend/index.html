@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#151a2e">
+  <title>Certificados de Calibração · Schulz</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23151a2e'/%3E%3Cpath d='M9 17l5 5 9-11' stroke='%23f7b731' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+  <section id="tela-login" class="login" hidden>
+    <div class="card">
+      <h1>Certificados de Calibração</h1>
+      <p class="sub">Laboratório de Metrologia · acesso restrito</p>
+      <div id="login-msg"></div>
+
+      <form id="form-senha" autocomplete="on">
+        <div class="campo"><label for="login-email">E-mail</label><input id="login-email" type="email" autocomplete="username" required></div>
+        <div class="campo"><label for="login-senha">Senha</label><input id="login-senha" type="password" autocomplete="current-password" required></div>
+        <button class="btn" type="submit" style="width:100%">Entrar</button>
+      </form>
+
+      <form id="form-nova-senha" hidden>
+        <p>Primeiro acesso: defina uma nova senha.</p>
+        <div class="campo"><label for="nova-senha">Nova senha</label><input id="nova-senha" type="password" autocomplete="new-password" minlength="10" required>
+          <span class="ajuda">Mínimo de 10 caracteres, com maiúscula, minúscula, número e símbolo.</span></div>
+        <div class="campo"><label for="nova-senha2">Repita a nova senha</label><input id="nova-senha2" type="password" autocomplete="new-password" minlength="10" required></div>
+        <button class="btn" type="submit" style="width:100%">Salvar senha</button>
+      </form>
+
+      <form id="form-mfa-config" hidden>
+        <p><strong>Configure o segundo fator (MFA).</strong> Abra o Google Authenticator, Microsoft Authenticator ou similar e leia o QR Code:</p>
+        <div class="mfa-qr" id="mfa-qr"></div>
+        <p class="nota">Sem câmera? Digite a chave manualmente:</p>
+        <p class="segredo" id="mfa-segredo"></p>
+        <div class="campo"><label for="mfa-codigo-config">Código de 6 dígitos do aplicativo</label><input id="mfa-codigo-config" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></div>
+        <button class="btn" type="submit" style="width:100%">Confirmar</button>
+      </form>
+
+      <form id="form-mfa" hidden>
+        <div class="campo"><label for="mfa-codigo">Código do aplicativo autenticador</label><input id="mfa-codigo" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></div>
+        <button class="btn" type="submit" style="width:100%">Verificar</button>
+      </form>
+      <p class="nota" style="margin-top:18px">Validação pública de certificados: <a href="validar.html">ler QR Code</a></p>
+    </div>
+  </section>
+
+  <div id="app" hidden>
+    <header class="topo">
+      <div class="in">
+        <a class="marca" href="#/">Schulz · Certificados de Calibração<small>Plataforma Web Gestora · Projeto Aplicado III</small></a>
+        <nav id="menu" aria-label="Menu principal"></nav>
+        <div class="usuario"><span id="usuario-nome"></span><span class="grupos" id="usuario-grupos"></span>
+          <button class="btn mini claro" id="sair" type="button">Sair</button></div>
+      </div>
+    </header>
+    <main id="conteudo" tabindex="-1"></main>
+    <footer>Protótipo acadêmico · UniSENAI · Projeto Aplicado III · Grupo 45 · Arquitetura serverless AWS (Free Tier)</footer>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="vendor/qrcode.min.js"></script>
+  <script src="comum.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
