@@ -1,0 +1,867 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Schulz S.A. - Automação da emissão de certificados de calibração (PA III, Grupo 45).
+  Plataforma web serverless na camada gratuita da AWS conforme arquitetura da AV02.
+
+Parameters:
+  ModoPublicacao:
+    Type: String
+    Default: cloudfront
+    AllowedValues: [cloudfront, direto]
+    Description: >-
+      cloudfront = site e API atrás do Amazon CloudFront com OAC (arquitetura da AV02).
+      direto = contingência para contas ainda não verificadas para o CloudFront (site no S3 Website e Function URLs públicas com validação do token).
+  EmailAlertas:
+    Type: String
+    Default: ""
+    Description: E-mail que recebe alertas de falha, reprovação e orçamento (deixe vazio para não criar a assinatura).
+  MfaObrigatorio:
+    Type: String
+    Default: "ON"
+    AllowedValues: ["ON", "OFF"]
+    Description: MFA por aplicativo autenticador (TOTP) obrigatório no login.
+
+Conditions:
+  UsarCloudFront: !Equals [!Ref ModoPublicacao, cloudfront]
+  Direto: !Equals [!Ref ModoPublicacao, direto]
+  TemEmail: !Not [!Equals [!Ref EmailAlertas, ""]]
+  ComMfa: !Equals [!Ref MfaObrigatorio, "ON"]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    CodeUri: backend/
+    MemorySize: 256
+    Timeout: 30
+    Layers: [!Ref CamadaDependencias]
+    Environment:
+      Variables:
+        TABELA: !Ref Tabela
+        BUCKET_UPLOADS: !Sub "${AWS::StackName}-uploads-${AWS::AccountId}"
+        BUCKET_CERTIFICADOS: !Sub "${AWS::StackName}-certificados-${AWS::AccountId}"
+        USER_POOL_ID: !Ref UsuariosPool
+        CLIENT_ID: !Ref UsuariosClienteWeb
+        TOPICO_ALERTAS: !Ref TopicoAlertas
+
+Resources:
+  CamadaDependencias:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-dependencias"
+      Description: openpyxl, reportlab e Pillow para Python 3.12 arm64
+      ContentUri: camada/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [arm64]
+      RetentionPolicy: Delete
+
+  Tabela:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-calibracao"
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: {ReadCapacityUnits: 10, WriteCapacityUnits: 10}
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+        - {AttributeName: SK, AttributeType: S}
+        - {AttributeName: GSI1PK, AttributeType: S}
+        - {AttributeName: GSI1SK, AttributeType: S}
+        - {AttributeName: GSI2PK, AttributeType: S}
+        - {AttributeName: GSI2SK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+        - {AttributeName: SK, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - {AttributeName: GSI1PK, KeyType: HASH}
+            - {AttributeName: GSI1SK, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+          ProvisionedThroughput: {ReadCapacityUnits: 5, WriteCapacityUnits: 5}
+        - IndexName: GSI2
+          KeySchema:
+            - {AttributeName: GSI2PK, KeyType: HASH}
+            - {AttributeName: GSI2SK, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+          ProvisionedThroughput: {ReadCapacityUnits: 5, WriteCapacityUnits: 5}
+      TimeToLiveSpecification: {AttributeName: expira_em, Enabled: true}
+      SSESpecification: {SSEEnabled: false}
+
+  BucketSite:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-site-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration: !If
+        - UsarCloudFront
+        - {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+        - {BlockPublicAcls: true, BlockPublicPolicy: false, IgnorePublicAcls: true, RestrictPublicBuckets: false}
+      WebsiteConfiguration: !If
+        - Direto
+        - {IndexDocument: index.html}
+        - !Ref AWS::NoValue
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+
+  PoliticaBucketSite:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketSite
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: !If
+          - UsarCloudFront
+          - - Sid: SomenteCloudFront
+              Effect: Allow
+              Principal: {Service: cloudfront.amazonaws.com}
+              Action: s3:GetObject
+              Resource: !Sub "${BucketSite.Arn}/*"
+              Condition:
+                StringEquals:
+                  AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao}"
+            - Sid: NegarSemTLS
+              Effect: Deny
+              Principal: "*"
+              Action: s3:*
+              Resource: [!GetAtt BucketSite.Arn, !Sub "${BucketSite.Arn}/*"]
+              Condition: {Bool: {aws:SecureTransport: "false"}}
+          - - Sid: LeituraPublicaDoSite
+              Effect: Allow
+              Principal: "*"
+              Action: s3:GetObject
+              Resource: !Sub "${BucketSite.Arn}/*"
+
+  BucketUploads:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-uploads-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins: ["*"]
+            AllowedHeaders: ["*"]
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpirarPlanilhas30Dias
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 30
+          - Id: LimparEnviosIncompletos
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+
+  PoliticaBucketUploads:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketUploads
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: NegarSemTLS
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt BucketUploads.Arn, !Sub "${BucketUploads.Arn}/*"]
+            Condition: {Bool: {aws:SecureTransport: "false"}}
+
+  BucketCertificados:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-certificados-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      VersioningConfiguration: {Status: Enabled}
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention: {Mode: GOVERNANCE, Days: 1}
+
+  PoliticaBucketCertificados:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketCertificados
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: NegarSemTLS
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt BucketCertificados.Arn, !Sub "${BucketCertificados.Arn}/*"]
+            Condition: {Bool: {aws:SecureTransport: "false"}}
+          - Sid: CertificadosImutaveis
+            Effect: Deny
+            Principal: "*"
+            Action: [s3:DeleteObject, s3:DeleteObjectVersion]
+            Resource: !Sub "${BucketCertificados.Arn}/*"
+
+  FilaFalhas:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-falhas-processamento"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  TopicoAlertas:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alertas"
+      DisplayName: Alertas Schulz PoC
+
+  AssinaturaAlertas:
+    Type: AWS::SNS::Subscription
+    Condition: TemEmail
+    Properties:
+      TopicArn: !Ref TopicoAlertas
+      Protocol: email
+      Endpoint: !Ref EmailAlertas
+
+  OrcamentoGastoZero:
+    Type: AWS::Budgets::Budget
+    Condition: TemEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-gasto-zero"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: 1, Unit: USD}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 1, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref EmailAlertas}]
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref EmailAlertas}]
+
+  UsuariosPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-usuarios"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig: {AllowAdminCreateUserOnly: true}
+      MfaConfiguration: !If [ComMfa, "ON", "OFF"]
+      EnabledMfas: !If [ComMfa, [SOFTWARE_TOKEN_MFA], !Ref AWS::NoValue]
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{Name: verified_email, Priority: 1}]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      DeletionProtection: INACTIVE
+
+  UsuariosClienteWeb:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UsuariosPool
+      ClientName: plataforma-web
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 12
+      TokenValidityUnits: {IdToken: minutes, AccessToken: minutes, RefreshToken: hours}
+
+  GrupoTecnico:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UsuariosPool
+      GroupName: tecnico
+      Description: "Técnico executante: envia planilhas"
+
+  GrupoSignatario:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UsuariosPool
+      GroupName: signatario
+      Description: "Signatário autorizado: assina e emite (RN06)"
+
+  GrupoAuditor:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UsuariosPool
+      GroupName: auditor
+      Description: "Auditor: somente leitura"
+
+  GrupoAdmin:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UsuariosPool
+      GroupName: admin
+      Description: "Administrador: cadastros"
+
+  LogsGerarUrlUpload:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-gerar-url-upload"
+      RetentionInDays: 14
+
+  GerarUrlUpload:
+    Type: AWS::Serverless::Function
+    DependsOn: LogsGerarUrlUpload
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-gerar-url-upload"
+      Handler: funcoes.gerar_url_upload.handler
+      MemorySize: 256
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-uploads-${AWS::AccountId}/uploads/*"
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt Tabela.Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys: ["IMP#*", "AUD#*"]
+
+  UrlUploads:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt GerarUrlUpload.Arn
+      AuthType: !If [UsarCloudFront, AWS_IAM, NONE]
+      Cors: !If
+        - UsarCloudFront
+        - !Ref AWS::NoValue
+        - AllowOrigins: ["*"]
+          AllowMethods: [GET, POST, PUT]
+          AllowHeaders: [content-type, x-token-acesso, x-amz-content-sha256]
+          MaxAge: 300
+
+  PermissaoUrlCloudFrontUploads:
+    Type: AWS::Lambda::Permission
+    Condition: UsarCloudFront
+    Properties:
+      FunctionName: !GetAtt GerarUrlUpload.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao}"
+
+  PermissaoInvocarCloudFrontUploads:
+    Type: AWS::Lambda::Permission
+    Condition: UsarCloudFront
+    Properties:
+      FunctionName: !GetAtt GerarUrlUpload.Arn
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao}"
+
+  PermissaoUrlPublicaUploads:
+    Type: AWS::Lambda::Permission
+    Condition: Direto
+    Properties:
+      FunctionName: !GetAtt GerarUrlUpload.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  PermissaoInvocarPublicaUploads:
+    Type: AWS::Lambda::Permission
+    Condition: Direto
+    Properties:
+      FunctionName: !GetAtt GerarUrlUpload.Arn
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  LogsEmitirCertificado:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-emitir-certificado"
+      RetentionInDays: 14
+
+  EmitirCertificado:
+    Type: AWS::Serverless::Function
+    DependsOn: LogsEmitirCertificado
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-emitir-certificado"
+      Handler: funcoes.emitir_certificado.handler
+      MemorySize: 512
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-certificados-${AWS::AccountId}/certificados/*"
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:Scan, dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: [!GetAtt Tabela.Arn, !Sub "${Tabela.Arn}/index/*"]
+            - Effect: Allow
+              Action: dynamodb:DeleteItem
+              Resource: !GetAtt Tabela.Arn
+              Condition:
+                ForAllValues:StringEquals:
+                  dynamodb:LeadingKeys: [PENDENTES]
+            - Effect: Deny
+              Action: [s3:DeleteObject, s3:DeleteObjectVersion]
+              Resource: "*"
+
+  UrlEmissao:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt EmitirCertificado.Arn
+      AuthType: !If [UsarCloudFront, AWS_IAM, NONE]
+      Cors: !If
+        - UsarCloudFront
+        - !Ref AWS::NoValue
+        - AllowOrigins: ["*"]
+          AllowMethods: [GET, POST, PUT]
+          AllowHeaders: [content-type, x-token-acesso, x-amz-content-sha256]
+          MaxAge: 300
+
+  PermissaoUrlCloudFrontEmissao:
+    Type: AWS::Lambda::Permission
+    Condition: UsarCloudFront
+    Properties:
+      FunctionName: !GetAtt EmitirCertificado.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao}"
+
+  PermissaoInvocarCloudFrontEmissao:
+    Type: AWS::Lambda::Permission
+    Condition: UsarCloudFront
+    Properties:
+      FunctionName: !GetAtt EmitirCertificado.Arn
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao}"
+
+  PermissaoUrlPublicaEmissao:
+    Type: AWS::Lambda::Permission
+    Condition: Direto
+    Properties:
+      FunctionName: !GetAtt EmitirCertificado.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  PermissaoInvocarPublicaEmissao:
+    Type: AWS::Lambda::Permission
+    Condition: Direto
+    Properties:
+      FunctionName: !GetAtt EmitirCertificado.Arn
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  LogsCadastros:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-cadastros"
+      RetentionInDays: 14
+
+  Cadastros:
+    Type: AWS::Serverless::Function
+    DependsOn: LogsCadastros
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-cadastros"
+      Handler: funcoes.cadastros.handler
+      MemorySize: 256
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:Scan]
+              Resource: [!GetAtt Tabela.Arn, !Sub "${Tabela.Arn}/index/*"]
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+              Resource: !GetAtt Tabela.Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys: ["INST#*", "PAD#*", "PROC#*", "AUD#*"]
+
+  UrlCadastros:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt Cadastros.Arn
+      AuthType: !If [UsarCloudFront, AWS_IAM, NONE]
+      Cors: !If
+        - UsarCloudFront
+        - !Ref AWS::NoValue
+        - AllowOrigins: ["*"]
+          AllowMethods: [GET, POST, PUT]
+          AllowHeaders: [content-type, x-token-acesso, x-amz-content-sha256]
+          MaxAge: 300
+
+  PermissaoUrlCloudFrontCadastros:
+    Type: AWS::Lambda::Permission
+    Condition: UsarCloudFront
+    Properties:
+      FunctionName: !GetAtt Cadastros.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao}"
+
+  PermissaoInvocarCloudFrontCadastros:
+    Type: AWS::Lambda::Permission
+    Condition: UsarCloudFront
+    Properties:
+      FunctionName: !GetAtt Cadastros.Arn
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao}"
+
+  PermissaoUrlPublicaCadastros:
+    Type: AWS::Lambda::Permission
+    Condition: Direto
+    Properties:
+      FunctionName: !GetAtt Cadastros.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  PermissaoInvocarPublicaCadastros:
+    Type: AWS::Lambda::Permission
+    Condition: Direto
+    Properties:
+      FunctionName: !GetAtt Cadastros.Arn
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  LogsConsultarObterCertificado:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-consultar-obter-certificado"
+      RetentionInDays: 14
+
+  ConsultarObterCertificado:
+    Type: AWS::Serverless::Function
+    DependsOn: LogsConsultarObterCertificado
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-consultar-obter-certificado"
+      Handler: funcoes.consultar_obter_certificado.handler
+      MemorySize: 256
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:Scan]
+              Resource: [!GetAtt Tabela.Arn, !Sub "${Tabela.Arn}/index/*"]
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt Tabela.Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys: ["AUD#*"]
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-certificados-${AWS::AccountId}/certificados/*"
+
+  UrlConsulta:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ConsultarObterCertificado.Arn
+      AuthType: !If [UsarCloudFront, AWS_IAM, NONE]
+      Cors: !If
+        - UsarCloudFront
+        - !Ref AWS::NoValue
+        - AllowOrigins: ["*"]
+          AllowMethods: [GET, POST, PUT]
+          AllowHeaders: [content-type, x-token-acesso, x-amz-content-sha256]
+          MaxAge: 300
+
+  PermissaoUrlCloudFrontConsulta:
+    Type: AWS::Lambda::Permission
+    Condition: UsarCloudFront
+    Properties:
+      FunctionName: !GetAtt ConsultarObterCertificado.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao}"
+
+  PermissaoInvocarCloudFrontConsulta:
+    Type: AWS::Lambda::Permission
+    Condition: UsarCloudFront
+    Properties:
+      FunctionName: !GetAtt ConsultarObterCertificado.Arn
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribuicao}"
+
+  PermissaoUrlPublicaConsulta:
+    Type: AWS::Lambda::Permission
+    Condition: Direto
+    Properties:
+      FunctionName: !GetAtt ConsultarObterCertificado.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  PermissaoInvocarPublicaConsulta:
+    Type: AWS::Lambda::Permission
+    Condition: Direto
+    Properties:
+      FunctionName: !GetAtt ConsultarObterCertificado.Arn
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  LogsProcessarPlanilha:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-processar-planilha"
+      RetentionInDays: 14
+
+  ProcessarPlanilha:
+    Type: AWS::Serverless::Function
+    DependsOn: LogsProcessarPlanilha
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-processar-planilha"
+      Handler: funcoes.processar_planilha.handler
+      MemorySize: 512
+      Timeout: 60
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-uploads-${AWS::AccountId}/uploads/*"
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:Scan, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:BatchWriteItem]
+              Resource: [!GetAtt Tabela.Arn, !Sub "${Tabela.Arn}/index/*"]
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref TopicoAlertas
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt FilaFalhas.Arn
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        MaximumEventAgeInSeconds: 3600
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt FilaFalhas.Arn
+      Events:
+        PlanilhaEnviada:
+          Type: S3
+          Properties:
+            Bucket: !Ref BucketUploads
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - {Name: prefix, Value: uploads/}
+                  - {Name: suffix, Value: .xlsx}
+
+  OacSite:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: UsarCloudFront
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac-site"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  OacApi:
+    Type: AWS::CloudFront::OriginAccessControl
+    Condition: UsarCloudFront
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac-api"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribuicao:
+    Type: AWS::CloudFront::Distribution
+    Condition: UsarCloudFront
+    Properties:
+      DistributionConfig:
+        Comment: Schulz - certificados de calibracao (PoC PA III)
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+        DefaultRootObject: index.html
+        ViewerCertificate: {CloudFrontDefaultCertificate: true}
+        Origins:
+          - Id: site
+            DomainName: !GetAtt BucketSite.RegionalDomainName
+            S3OriginConfig: {OriginAccessIdentity: ""}
+            OriginAccessControlId: !GetAtt OacSite.Id
+          - Id: api-uploads
+            DomainName: !Select [2, !Split ["/", !GetAtt UrlUploads.FunctionUrl]]
+            OriginAccessControlId: !GetAtt OacApi.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+          - Id: api-emissao
+            DomainName: !Select [2, !Split ["/", !GetAtt UrlEmissao.FunctionUrl]]
+            OriginAccessControlId: !GetAtt OacApi.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+          - Id: api-cadastros
+            DomainName: !Select [2, !Split ["/", !GetAtt UrlCadastros.FunctionUrl]]
+            OriginAccessControlId: !GetAtt OacApi.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+          - Id: api-consulta
+            DomainName: !Select [2, !Split ["/", !GetAtt UrlConsulta.FunctionUrl]]
+            OriginAccessControlId: !GetAtt OacApi.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+        CacheBehaviors:
+          - PathPattern: "/api/uploads*"
+            TargetOriginId: api-uploads
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          - PathPattern: "/api/emissao*"
+            TargetOriginId: api-emissao
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          - PathPattern: "/api/cadastros*"
+            TargetOriginId: api-cadastros
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          - PathPattern: "/api/*"
+            TargetOriginId: api-consulta
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+
+  AlarmeFilaFalhas:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-planilhas-na-fila-de-falhas"
+      AlarmDescription: Planilha que falhou após as retentativas (DLQ)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt FilaFalhas.QueueName}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlertas]
+
+  AlarmeErrosProcessarPlanilha:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-erros-processar-planilha"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref ProcessarPlanilha}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlertas]
+
+  AlarmeErrosEmitirCertificado:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-erros-emitir-certificado"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref EmitirCertificado}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlertas]
+
+  AlarmeErrosConsultarObterCertificado:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-erros-consultar-obter-certificado"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref ConsultarObterCertificado}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TopicoAlertas]
+
+Outputs:
+  Modo:
+    Value: !Ref ModoPublicacao
+  UrlSite:
+    Description: Endereço da plataforma web
+    Value: !If [UsarCloudFront, !Sub "https://${Distribuicao.DomainName}", !GetAtt BucketSite.WebsiteURL]
+  DistribuicaoId:
+    Condition: UsarCloudFront
+    Value: !Ref Distribuicao
+  BucketSite:
+    Value: !Ref BucketSite
+  BucketUploads:
+    Value: !Ref BucketUploads
+  BucketCertificados:
+    Value: !Ref BucketCertificados
+  Tabela:
+    Value: !Ref Tabela
+  UserPoolId:
+    Value: !Ref UsuariosPool
+  ClientId:
+    Value: !Ref UsuariosClienteWeb
+  Regiao:
+    Value: !Ref AWS::Region
+  UrlFuncaoUploads:
+    Value: !GetAtt UrlUploads.FunctionUrl
+  UrlFuncaoEmissao:
+    Value: !GetAtt UrlEmissao.FunctionUrl
+  UrlFuncaoCadastros:
+    Value: !GetAtt UrlCadastros.FunctionUrl
+  UrlFuncaoConsulta:
+    Value: !GetAtt UrlConsulta.FunctionUrl

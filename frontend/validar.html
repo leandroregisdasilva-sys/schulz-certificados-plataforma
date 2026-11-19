@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#151a2e">
+  <meta name="robots" content="noindex">
+  <title>Validação de Certificado · Schulz</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23151a2e'/%3E%3Cpath d='M9 17l5 5 9-11' stroke='%23f7b731' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="estilo.css">
+</head>
+<body class="validar">
+  <header class="topo">
+    <div class="in">
+      <a class="marca" href="validar.html">Validação de Certificado<small>Laboratório de Metrologia · chão de fábrica</small></a>
+    </div>
+  </header>
+  <main>
+    <div id="resultado"></div>
+
+    <section class="card" id="leitor" style="margin-bottom:18px">
+      <h2 style="margin-top:0">Ler QR Code do certificado</h2>
+      <p class="nota">Aponte a câmera para o QR Code impresso no certificado. No iPhone, a câmera nativa também abre esta página.</p>
+      <video id="camera" class="camera" playsinline muted hidden></video>
+      <div class="acoes">
+        <button class="btn" id="abrir-camera" type="button">Abrir câmera</button>
+        <button class="btn sec" id="parar-camera" type="button" hidden>Parar</button>
+      </div>
+      <form id="form-codigo" class="filtros" style="margin-top:16px">
+        <div class="campo" style="flex:1"><label for="codigo">Ou digite o código de validação</label><input id="codigo" autocomplete="off" spellcheck="false" placeholder="ex.: Ab3dE5fG7hJ9kL1m"></div>
+        <button class="btn" type="submit">Validar</button>
+      </form>
+    </section>
+  </main>
+  <footer>Protótipo acadêmico · UniSENAI · Projeto Aplicado III · Grupo 45</footer>
+  <script src="config.js"></script>
+  <script src="comum.js"></script>
+  <script src="validar.js"></script>
+</body>
+</html>

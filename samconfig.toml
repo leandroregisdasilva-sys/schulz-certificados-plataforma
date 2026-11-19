@@ -1,0 +1,20 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "schulz"
+
+[default.deploy.parameters]
+stack_name = "schulz"
+region = "sa-east-1"
+template_file = "template.yaml"
+resolve_s3 = true
+s3_prefix = "schulz"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+tags = "Projeto=\"Schulz-PoC\""
+
+[default.delete.parameters]
+stack_name = "schulz"
+region = "sa-east-1"
+no_prompts = true
